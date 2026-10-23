@@ -1,0 +1,229 @@
+name: scout
+
+on:
+
+  schedule:
+    - cron: '10 13 * * 1-5'
+    - cron: '10 17 * * 6'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository to run against (blank = its default branch)'
+        required: false
+      profile:
+        description: 'Candidate profile to score against'
+        default: 'pamela'
+        required: false
+      only:
+        description: 'Comma-separated company ids to fetch (blank = all)'
+        default: ''
+        required: false
+      health_only:
+        description: 'Probe every feed and report which boards answer, without scoring'
+        type: boolean
+        default: false
+      recrawl:
+        description: 'Company ids to re-read from scratch, ignoring the rung-3 read log and the lastmod window'
+        default: ''
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youwork-corpus-write
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: node engine/ci/quiet-shell.mjs {0}
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: ${{ github.event_name != 'schedule' || github.repository == 'pamelaestivam/job-hunter' }}
+
+    steps:
+      - name: Record when this run started
+        shell: bash
+        run: echo "RUN_STARTED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
+
+      - name: Decide where this run reads and writes
+        shell: bash
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$DATA_REPO" ]; then
+            echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-master}" >> "$GITHUB_ENV"
+          else
+            echo "QUIET_LOGS=" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO || github.repository }}
+          token: ${{ secrets.DATA_TOKEN || github.token }}
+          ref: ${{ env.DATA_BRANCH }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Self-test the engine before trusting a run
+        run: node engine/test/run.mjs
+
+      - name: Attest every generated artifact
+        run: node engine/attest.mjs --all
+
+      - name: Probe feed health
+        if: ${{ inputs.health_only == true }}
+        run: node engine/scout.mjs --health-only > /tmp/health.json 2>/tmp/health.log || true
+
+      - name: Run the search
+        if: ${{ inputs.health_only != true }}
+        env:
+          PROFILE: ${{ inputs.profile }}
+          ONLY: ${{ inputs.only }}
+          RECRAWL: ${{ inputs.recrawl }}
+        run: |
+          set -- --profile="${PROFILE:-pamela}"
+          if [ -n "$ONLY" ]; then set -- "$@" --only="$ONLY" --force-partial; fi
+          if [ -n "$RECRAWL" ]; then set -- "$@" --recrawl="$RECRAWL"; fi
+          node engine/scout.mjs "$@"
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## Scout run — $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            if [ -f data/jobs.json ]; then
+              node -e '
+                const d = require("./data/jobs.json");
+                const h = require("./data/health.json");
+                // This step is `if: always()` and reads the file from the checkout, so
+                // when the search step fails it printed the PREVIOUS run’s results under
+                // today’s date as though this run had produced them. Say when that is
+                // what you are looking at.
+                const started = Date.parse(process.env.RUN_STARTED_AT || "");
+                const produced = Date.parse(d.generated_at || "");
+                if (Number.isFinite(started) && Number.isFinite(produced) && produced < started) {
+                  console.log(`> ⚠️ **STALE — this run produced no output.** What follows is the last committed result, from ${String(d.generated_at).slice(0, 16).replace("T", " ")} UTC.`);
+                  console.log();
+                }
+                console.log(`**${d.counts.apply} apply-now · ${d.counts.referral} referral-first · ${d.counts.ambiguous} to review**`);
+                console.log();
+                console.log(`| | |`);
+                console.log(`|---|---|`);
+                console.log(`| Feeds answered | ${h.companies_ok}/${h.companies_total} |`);
+                console.log(`| Postings fetched | ${h.jobs_fetched} |`);
+                console.log(`| Inside the commute box | ${h.in_box} |`);
+                console.log();
+                const top = d.jobs.filter(j => j.fit.score >= d.thresholds.apply).slice(0, 12);
+                if (top.length) {
+                  console.log("### Top of the list");
+                  console.log();
+                  console.log("| | Role | Company | Where | Score |");
+                  console.log("|---|---|---|---|---|");
+                  for (const j of top) console.log(`| \`${j.pick_id}\` | [${j.title}](${j.apply_url}) | ${j.company} | ${(j.geo.matched||[])[0] ?? "?"} | ${j.fit.score} |`);
+                }
+                if (h.failures.length) {
+                  console.log();
+                  console.log(`### ${h.failures.length} feeds failed`);
+                  console.log();
+                  for (const f of h.failures) console.log(`- \`${f.company}\` (${f.confidence ?? "?"}) — ${f.error}`);
+                }
+              '
+            elif [ -f /tmp/health.json ]; then
+              node -e '
+                const h = JSON.parse(require("fs").readFileSync("/tmp/health.json","utf8"));
+                console.log(`**${h.companies_ok}/${h.companies_total} employer feeds answered.**`);
+                console.log();
+                const ok = h.per_company.filter(c => c.ok).sort((a,b) => b.count - a.count);
+                console.log("| Employer | Postings |");
+                console.log("|---|---:|");
+                for (const c of ok) console.log(`| ${c.company} | ${c.count} |`);
+                if (h.failures.length) {
+                  console.log();
+                  console.log(`### ${h.failures.length} feeds did not answer — these are employers we are currently blind to`);
+                  console.log();
+                  console.log("| Employer | Registry confidence | Error |");
+                  console.log("|---|---|---|");
+                  for (const f of h.failures) console.log(`| \`${f.company}\` | ${f.confidence ?? "?"} | ${f.error} |`);
+                  console.log();
+                  console.log("Next: run the **discover** workflow in `repair` mode. It prints corrected registry");
+                  console.log("entries to paste into `engine/registry/companies.json`. Nothing auto-commits —");
+                  console.log("a wrong token written silently into the registry is worse than a missing one.");
+                }
+              '
+            else
+              echo "No results and no health probe output. Check the step logs above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check data/ holds together before committing it
+        if: ${{ inputs.health_only != true }}
+        run: node engine/verify-data.mjs
+
+      - name: Write the KPI scoreboard
+        if: ${{ inputs.health_only != true }}
+        run: node engine/kpi.mjs --write >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Commit the day's results
+        if: ${{ inputs.health_only != true }}
+        run: |
+          git config user.name  "youwork-scout"
+          git config user.email "scout@users.noreply.github.com"
+          git add -A data/
+          if git diff --staged --quiet; then
+            echo "No change in the market since the last run."
+            exit 0
+          fi
+          COUNT=$(node -e 'console.log(require("./data/jobs.json").counts.apply)')
+          NEW=$(node -e '
+            const s=require("./data/seen.json");
+            const today=new Date().toISOString().slice(0,10);
+            console.log(Object.values(s).filter(v=>String(v.first_seen).slice(0,10)===today).length)
+          ')
+          git commit -m "scout: ${COUNT} apply-now roles, ${NEW} new today [skip ci]"
+          pushed=""
+          for i in 1 2 3 4; do
+            if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
+            echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
+            if ! git pull --rebase origin "${DATA_BRANCH}"; then
+              if node engine/merge-data.mjs && git add -A data/ && GIT_EDITOR=true git rebase --continue; then
+                echo "resolved a data/ conflict with merge-data.mjs"
+              else
+                echo "::warning title=Could not resolve the data/ conflict::rebase aborted; retrying from our own commit"
+                git rebase --abort || true
+              fi
+            fi
+          done
+          if [ -z "$pushed" ]; then
+            echo "::error title=Scout results were not committed::4 push attempts failed. The digest and the first_seen ledger for this run exist only in the workflow artifact."
+            exit 1
+          fi
+
+      - name: Keep the digest downloadable even if the commit is skipped
+        if: ${{ always() && env.QUIET_LOGS != '1' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-${{ github.run_number }}
+          path: |
+            data/digest/
+            data/jobs.json
+            data/health.json
+            data/seen.json
+            data/decisions.json
+            data/pipeline.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Save the quiet logs in the data repository
+        if: ${{ always() && env.QUIET_LOGS == '1' }}
+        shell: bash
+        run: node engine/ci/save-logs.mjs

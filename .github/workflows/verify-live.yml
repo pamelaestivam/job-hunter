@@ -1,0 +1,162 @@
+name: verify-live
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository to run against (blank = its default branch)'
+        required: false
+      picks:
+        description: 'Comma-separated pick ids to verify (the list about to be sent)'
+        required: false
+      company:
+        description: 'Verify every published row for one employer id'
+        required: false
+      band:
+        description: 'Verify everything at or above the review bar'
+        type: boolean
+        default: false
+      stale:
+        description: 'Verify every published row with no fresh verdict'
+        type: boolean
+        default: false
+      limit:
+        description: 'Maximum requisitions to fetch (default 400)'
+        required: false
+
+  schedule:
+    - cron: '10 14 * * 1-5'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youwork-liveness-write
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: node engine/ci/quiet-shell.mjs {0}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event_name != 'schedule' || github.repository == 'pamelaestivam/job-hunter' }}
+    steps:
+      - name: Decide where this run reads and writes
+        shell: bash
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$DATA_REPO" ]; then
+            echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-master}" >> "$GITHUB_ENV"
+          else
+            echo "QUIET_LOGS=" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO || github.repository }}
+          token: ${{ secrets.DATA_TOKEN || github.token }}
+          ref: ${{ env.DATA_BRANCH }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: '.nvmrc' }
+
+      - name: Verify
+        env:
+          PICKS: ${{ inputs.picks }}
+          COMPANY: ${{ inputs.company }}
+          BAND: ${{ inputs.band }}
+          STALE: ${{ inputs.stale }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          set --
+          if [ -n "$PICKS" ]; then
+            node -e 'process.stdout.write(JSON.stringify(process.env.PICKS.split(",").map(s=>({id:s.trim()})).filter(p=>p.id)))' > /tmp/picks.json
+            set -- "$@" --picks /tmp/picks.json
+          fi
+          if [ -n "$COMPANY" ]; then set -- "$@" --company="$COMPANY"; fi
+          if [ "$BAND" = "true" ]; then set -- "$@" --band; fi
+          if [ "$STALE" = "true" ]; then set -- "$@" --stale; fi
+          if [ -n "$LIMIT" ]; then set -- "$@" --limit="$LIMIT"; fi
+          if [ "$#" -eq 0 ]; then set -- --stale; fi
+          node engine/verify-live.mjs "$@" | tee /tmp/live.log
+
+      - name: Rebuild what she reads, so a dead role leaves the digest in this run
+        if: always()
+        run: node engine/rerender.mjs | tee -a /tmp/live.log
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## Liveness check, $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            if grep -q "nothing is stale" /tmp/live.log 2>/dev/null; then
+              echo "**Nothing was stale: every published requisition already has a fresh verdict, so nothing was checked.**"
+            elif [ -f data/liveness.json ]; then
+              node -e '
+                const l = require("./data/liveness.json");
+                const b = l.last_batch ?? {};
+                console.log(`**${b.checked ?? 0} checked: ${b.live ?? 0} live, ${b.gone ?? 0} gone, ${b.closed ?? 0} closed, ${b.unknown ?? 0} unknown.**`);
+                const dead = Object.entries(l.checks ?? {}).filter(([, v]) => v.state === "gone" || v.state === "closed");
+                if (dead.length) {
+                  console.log();
+                  console.log("### Must not be shown to her");
+                  console.log();
+                  console.log("| Requisition | State | Why |");
+                  console.log("|---|---|---|");
+                  for (const [k, v] of dead) console.log(`| \`${k}\` | ${v.state} | ${v.reason} |`);
+                }
+                const unknown = Object.entries(l.checks ?? {}).filter(([, v]) => v.state === "unknown");
+                if (unknown.length) {
+                  console.log();
+                  console.log(`### ${unknown.length} could not be decided`);
+                  console.log();
+                  console.log("Unknown is not dead. These stay in the corpus and stay ungated for her lists.");
+                  console.log();
+                  for (const [k, v] of unknown.slice(0, 25)) console.log(`- \`${k}\`: ${v.reason}`);
+                }
+              '
+            else
+              echo "No liveness evidence was written. Check the step log."
+            fi
+            echo
+            echo '```'
+            tail -40 /tmp/live.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the evidence
+        if: always()
+        run: |
+          git config user.name  "youwork-liveness"
+          git config user.email "liveness@users.noreply.github.com"
+          git add -A data/liveness.json data/jobs.json data/digest data/box-inventory.json
+          if git diff --staged --quiet; then
+            echo "No change in liveness evidence."
+            exit 0
+          fi
+          git commit -m "liveness: requisitions verified $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
+          pushed=""
+          for i in 1 2 3 4; do
+            if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
+            echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
+            if ! git pull --rebase origin "${DATA_BRANCH}"; then
+              echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
+              git rebase --abort || true
+            fi
+          done
+          if [ -z "$pushed" ]; then
+            echo "::error title=Liveness evidence was not committed::4 push attempts failed. The evidence exists only in this run's log."
+            exit 1
+          fi
+
+      - name: Save the quiet logs in the data repository
+        if: ${{ always() && env.QUIET_LOGS == '1' }}
+        shell: bash
+        run: node engine/ci/save-logs.mjs

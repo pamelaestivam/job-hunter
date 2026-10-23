@@ -1,0 +1,107 @@
+name: pulse
+
+on:
+  schedule:
+    - cron: '10 21 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository to run against (blank = its default branch)'
+        required: false
+
+concurrency:
+  group: youwork-corpus-write
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: node engine/ci/quiet-shell.mjs {0}
+
+jobs:
+  pulse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.event_name != 'schedule' || github.repository == 'pamelaestivam/job-hunter' }}
+    steps:
+      - name: Decide where this run reads and writes
+        shell: bash
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$DATA_REPO" ]; then
+            echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-master}" >> "$GITHUB_ENV"
+          else
+            echo "QUIET_LOGS=" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO || github.repository }}
+          token: ${{ secrets.DATA_TOKEN || github.token }}
+          ref: ${{ env.DATA_BRANCH }}
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: '.nvmrc' }
+
+      - name: Pulse
+        run: node engine/scout.mjs --profile=pamela --pulse
+
+      - name: Write the KPI scoreboard
+        run: node engine/kpi.mjs --write || true
+
+      - name: Check data/ holds together before committing it
+        run: node engine/verify-data.mjs
+
+      - name: Commit only if something actually appeared
+        run: |
+          git config user.name  "youwork-pulse"
+          git config user.email "pulse@users.noreply.github.com"
+          git add -A data/
+          if git diff --staged --quiet; then
+            echo "Nothing new since the last pulse."
+            exit 0
+          fi
+          NEW=$(node -e 'try{console.log(require("./data/jobs.json").pulse_run?.added ?? 0)}catch{console.log(0)}')
+          git commit -m "pulse: ${NEW} new requisition(s) [skip ci]"
+          pushed=""
+          for i in 1 2 3 4; do
+            if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
+            echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
+            if ! git pull --rebase origin "${DATA_BRANCH}"; then
+              if node engine/merge-data.mjs && git add -A data/ && GIT_EDITOR=true git rebase --continue; then
+                echo "resolved a data/ conflict with merge-data.mjs"
+              else
+                echo "::warning title=Could not resolve the data/ conflict::rebase aborted; retrying from our own commit"
+                git rebase --abort || true
+              fi
+            fi
+          done
+          if [ -z "$pushed" ]; then
+            echo "::error title=Pulse results were not committed::4 push attempts failed."
+            exit 1
+          fi
+
+      - name: Say what appeared
+        if: always()
+        run: |
+          {
+            echo "## Pulse — $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            if [ -f data/digest/new.md ]; then
+              cat data/digest/new.md
+            else
+              echo "Nothing new since the last check."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save the quiet logs in the data repository
+        if: ${{ always() && env.QUIET_LOGS == '1' }}
+        shell: bash
+        run: node engine/ci/save-logs.mjs
