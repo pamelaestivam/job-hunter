@@ -20,6 +20,10 @@ on:
         description: 'Verify every published row with no fresh verdict'
         type: boolean
         default: false
+      kits:
+        description: 'Verify every finished kit she has not sent (read from the pipeline, no ids needed)'
+        type: boolean
+        default: false
       limit:
         description: 'Maximum requisitions to fetch (default 400)'
         required: false
@@ -72,6 +76,7 @@ jobs:
           COMPANY: ${{ inputs.company }}
           BAND: ${{ inputs.band }}
           STALE: ${{ inputs.stale }}
+          KITS: ${{ inputs.kits }}
           LIMIT: ${{ inputs.limit }}
         run: |
           set --
@@ -82,6 +87,7 @@ jobs:
           if [ -n "$COMPANY" ]; then set -- "$@" --company="$COMPANY"; fi
           if [ "$BAND" = "true" ]; then set -- "$@" --band; fi
           if [ "$STALE" = "true" ]; then set -- "$@" --stale; fi
+          if [ "$KITS" = "true" ]; then set -- "$@" --kits; fi
           if [ -n "$LIMIT" ]; then set -- "$@" --limit="$LIMIT"; fi
           if [ "$#" -eq 0 ]; then set -- --stale; fi
           node engine/verify-live.mjs "$@" | tee /tmp/live.log
