@@ -1,0 +1,135 @@
+name: probe-candidates
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository to run against (blank = its default branch)'
+        required: false
+      only:
+        description: 'Comma-separated candidate ids (blank = all)'
+        required: false
+      limit:
+        description: 'Probe only the first N candidates (blank = all)'
+        required: false
+      set:
+        description: 'Which candidate set: extended (default) or normal'
+        required: false
+        default: extended
+        type: choice
+        options: [extended, normal]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youwork-candidate-probe
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: node engine/ci/quiet-shell.mjs {0}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Decide where this run reads and writes
+        shell: bash
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$DATA_REPO" ]; then
+            echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-master}" >> "$GITHUB_ENV"
+          else
+            echo "QUIET_LOGS=" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO || github.repository }}
+          token: ${{ secrets.DATA_TOKEN || github.token }}
+          ref: ${{ env.DATA_BRANCH }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: '.nvmrc' }
+
+      - name: Choose the evidence file for this set
+        env:
+          SET: ${{ inputs.set }}
+        run: |
+          case "${SET:-extended}" in
+            extended) echo "EVIDENCE=data/probes/extended-candidates.json" >> "$GITHUB_ENV" ;;
+            normal)   echo "EVIDENCE=data/probes/normal-candidates.json"   >> "$GITHUB_ENV" ;;
+            *) echo "::error title=Unknown candidate set::'${SET}' is not extended or normal"; exit 1 ;;
+          esac
+          echo "SET=${SET:-extended}" >> "$GITHUB_ENV"
+
+      - name: Probe the candidates' public boards
+        env:
+          ONLY: ${{ inputs.only }}
+          LIMIT: ${{ inputs.limit }}
+          SET: ${{ inputs.set }}
+        run: |
+          set -- --set="${SET:-extended}"
+          if [ -n "$ONLY" ]; then set -- "$@" --only="$ONLY"; fi
+          if [ -n "$LIMIT" ]; then set -- "$@" --limit="$LIMIT"; fi
+          node engine/probe-candidates.mjs "$@" 2>&1 | tee /tmp/probe.log
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## Candidate probe (${EVIDENCE}), $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            if [ -f "$EVIDENCE" ]; then
+              node -e '
+                const d = require("./" + process.env.EVIDENCE);
+                console.log(`**${d.attempted} of ${d.candidates_total} candidates probed:** ${JSON.stringify(d.by_status)}`);
+                if (d.incomplete) console.log(`\nNOT REACHED (time budget): ${d.not_reached.length}`);
+              '
+            else
+              echo "No evidence was written. Check the step log."
+            fi
+            echo
+            echo '```'
+            tail -40 /tmp/probe.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the evidence
+        run: |
+          : "${EVIDENCE:?EVIDENCE is empty: the evidence-file step did not run or did not export it}"
+          git config user.name  "youwork-candidate-probe"
+          git config user.email "candidate-probe@users.noreply.github.com"
+          git add -A "$EVIDENCE"
+          if git diff --staged --quiet; then
+            echo "No change in the candidate evidence."
+            exit 0
+          fi
+          if git diff --staged --name-only | grep -vxF "$EVIDENCE"; then
+            echo "::error title=Candidate probe staged a file it does not own::refusing to commit"
+            exit 1
+          fi
+          git commit -m "probe-candidates: ${SET:-extended} candidate boards read $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
+          pushed=""
+          for i in 1 2 3 4; do
+            if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
+            echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
+            if ! git pull --rebase origin "${DATA_BRANCH}"; then
+              echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
+              git rebase --abort || true
+            fi
+          done
+          if [ -z "$pushed" ]; then
+            echo "::error title=Candidate evidence was not committed::4 push attempts failed."
+            exit 1
+          fi
+
+      - name: Save the quiet logs in the data repository
+        if: ${{ always() && env.QUIET_LOGS == '1' }}
+        shell: bash
+        run: node engine/ci/save-logs.mjs

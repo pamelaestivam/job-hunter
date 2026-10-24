@@ -1,0 +1,104 @@
+name: discover
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository to run against (blank = its default branch)'
+        required: false
+      mode:
+        description: 'repair the registry, discover one new company, or read the candidates file (candidates: no employer name needed)'
+        type: choice
+        options: [repair, discover, facets, boards, candidates]
+        default: repair
+      name:
+        description: 'Company name (discover mode)'
+        required: false
+      url:
+        description: 'Careers page URL (discover mode, optional but improves the hit rate)'
+        required: false
+      only:
+        description: 'Comma-separated company ids (facets mode: blank = every Workday tenant. boards mode: required)'
+        required: false
+  schedule:
+    - cron: '0 15 1 * *'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: node engine/ci/quiet-shell.mjs {0}
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ github.event_name != 'schedule' || github.repository == 'pamelaestivam/job-hunter' }}
+    steps:
+      - name: Decide where this run reads and writes
+        shell: bash
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$DATA_REPO" ]; then
+            echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-master}" >> "$GITHUB_ENV"
+          else
+            echo "QUIET_LOGS=" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO || github.repository }}
+          token: ${{ secrets.DATA_TOKEN || github.token }}
+          ref: ${{ env.DATA_BRANCH }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: '.nvmrc' }
+
+      - name: Probe
+        env:
+          MODE: ${{ inputs.mode }}
+          NAME: ${{ inputs.name }}
+          URL: ${{ inputs.url }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          {
+            echo '## ATS discovery'
+            echo
+            echo '```'
+            if [ "$MODE" = "discover" ]; then
+              if [ -n "$URL" ]; then
+                node engine/discover.mjs --name="$NAME" --url="$URL"
+              else
+                node engine/discover.mjs --name="$NAME"
+              fi
+            elif [ "$MODE" = "boards" ]; then
+              if [ -z "$ONLY" ]; then
+                echo 'boards mode needs --only: name the employers to compare.'
+                exit 2
+              else
+                node engine/boards.mjs --employer="$ONLY"
+              fi
+            elif [ "$MODE" = "candidates" ]; then
+              node engine/discover-candidates.mjs
+            elif [ "$MODE" = "facets" ]; then
+              if [ -n "$ONLY" ]; then
+                node engine/discover.mjs --facets --only="$ONLY"
+              else
+                node engine/discover.mjs --facets
+              fi
+            else
+              node engine/discover.mjs --repair
+            fi
+            echo '```'
+            echo
+            echo 'Nothing was committed. Paste any corrected entries into `engine/registry/companies.json` deliberately.'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Save the quiet logs in the data repository
+        if: ${{ always() && env.QUIET_LOGS == '1' }}
+        shell: bash
+        run: node engine/ci/save-logs.mjs
