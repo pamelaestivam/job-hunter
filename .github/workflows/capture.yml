@@ -1,0 +1,150 @@
+name: capture
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository to run against (blank = its default branch)'
+        required: false
+      only:
+        description: 'Plan ids or company ids, comma-separated (blank = every plan)'
+        required: false
+      url:
+        description: 'Ad-hoc URL to capture instead of a registry plan'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youwork-capture-write
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: node engine/ci/quiet-shell.mjs {0}
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Decide where this run reads and writes
+        shell: bash
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$DATA_REPO" ]; then
+            echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-master}" >> "$GITHUB_ENV"
+          else
+            echo "QUIET_LOGS=" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO || github.repository }}
+          token: ${{ secrets.DATA_TOKEN || github.token }}
+          ref: ${{ env.DATA_BRANCH }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: '.nvmrc' }
+
+      - name: Install a real browser
+        run: |
+          npm install --no-save playwright@1.49.1
+          npx playwright install --with-deps chromium
+
+      - name: Capture
+        env:
+          ONLY: ${{ inputs.only }}
+          URL: ${{ inputs.url }}
+        run: |
+          set --
+          if [ -n "$ONLY" ]; then set -- "$@" --only="$ONLY"; fi
+          if [ -n "$URL" ]; then set -- "$@" --url="$URL"; fi
+          node engine/capture.mjs "$@" 2>&1 | tee /tmp/capture.log
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## Browser capture, $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            if [ -f data/captures/latest.json ]; then
+              node -e '
+                const p = require("./data/captures/latest.json");
+                console.log(`**${p.found}/${p.captured} plan(s) found a job-shaped request.**`);
+                console.log();
+                console.log("| Plan | Verdict | robots | Requests kept | Best call |");
+                console.log("|---|---|---|---:|---|");
+                for (const r of p.results) {
+                  const best = r.best ? `\`${r.best.method} ${r.best.url.slice(0, 90)}\` (score ${r.best.score})` : "-";
+                  console.log(`| \`${r.id}\` | ${r.verdict} | ${r.robots?.verdict ?? "-"} | ${r.kept ?? 0}/${r.considered ?? 0} | ${best} |`);
+                }
+                for (const r of p.results) {
+                  console.log();
+                  console.log(`### ${r.id}`);
+                  if (r.why) console.log(`> ${r.why}`);
+                  console.log();
+                  if (r.best) {
+                    console.log("**Best candidate**");
+                    console.log("```");
+                    console.log(`${r.best.method} ${r.best.url}`);
+                    console.log(`status ${r.best.status}  rows ${r.best.rows}  score ${r.best.score}`);
+                    if (r.best.post_data_operation) console.log(`graphql operation: ${r.best.post_data_operation}`);
+                    console.log(`why: ${r.best.reasons.join("; ")}`);
+                    console.log("```");
+                  }
+                  if (r.opened && !r.opened.clicked) {
+                    console.log("**No posting was opened.** Selectors tried:");
+                    for (const t of r.opened.tried ?? []) console.log(`- \`${t.selector}\` matched ${t.matched}${t.click_error ? ` (click failed: ${t.click_error})` : ""}`);
+                  }
+                  console.log();
+                  console.log("<details><summary>Every request the page made</summary>");
+                  console.log();
+                  console.log("```");
+                  console.log(r.summary ?? "(nothing recorded)");
+                  console.log("```");
+                  console.log("</details>");
+                }
+              '
+            else
+              echo "No capture evidence file was produced. Check the step log."
+            fi
+            echo
+            echo '```'
+            tail -40 /tmp/capture.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the evidence
+        if: always()
+        run: |
+          git config user.name  "youwork-capture"
+          git config user.email "capture@users.noreply.github.com"
+          git add -A data/captures/
+          if git diff --staged --quiet; then
+            echo "No change in capture evidence."
+            exit 0
+          fi
+          git commit -m "capture: browser network evidence $(date -u '+%Y-%m-%d') [skip ci]"
+          pushed=""
+          for i in 1 2 3 4; do
+            if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
+            echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
+            if ! git pull --rebase origin "${DATA_BRANCH}"; then
+              echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
+              git rebase --abort || true
+            fi
+          done
+          if [ -z "$pushed" ]; then
+            echo "::error title=Capture evidence was not committed::4 push attempts failed. The evidence exists only in this run's log."
+            exit 1
+          fi
+
+      - name: Save the quiet logs in the data repository
+        if: ${{ always() && env.QUIET_LOGS == '1' }}
+        shell: bash
+        run: node engine/ci/save-logs.mjs
