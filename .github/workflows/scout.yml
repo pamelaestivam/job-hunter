@@ -41,7 +41,7 @@ defaults:
 jobs:
   scout:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     if: ${{ github.event_name != 'schedule' || github.repository == 'pamelaestivam/job-hunter' }}
 
     steps:
