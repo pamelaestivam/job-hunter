@@ -1,0 +1,127 @@
+name: board-sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository to run against (blank = its default branch)'
+        required: false
+      ats:
+        description: 'Only these hiring systems, comma separated (blank = greenhouse,lever,ashby)'
+        required: false
+      limit:
+        description: 'Read only the first N pending boards (blank = all)'
+        required: false
+      max_minutes:
+        description: 'Wall-clock budget for the reading, in minutes (default 240; the job limit is 300)'
+        required: false
+        default: '240'
+  schedule:
+    - cron: '30 4 3 * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youwork-board-sweep
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: node engine/ci/quiet-shell.mjs {0}
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    if: ${{ github.event_name != 'schedule' || github.repository == 'pamelaestivam/job-hunter' }}
+    steps:
+      - name: Decide where this run reads and writes
+        shell: bash
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$DATA_REPO" ]; then
+            echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-master}" >> "$GITHUB_ENV"
+          else
+            echo "QUIET_LOGS=" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO || github.repository }}
+          token: ${{ secrets.DATA_TOKEN || github.token }}
+          ref: ${{ env.DATA_BRANCH }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: '.nvmrc' }
+
+      - name: Refresh the published token lists
+        run: node engine/board-sweep.mjs --fetch-tokens || echo "::warning title=Token lists not refreshed::using the committed copy"
+
+      - name: Sweep the boards
+        env:
+          ATS: ${{ inputs.ats }}
+          LIMIT: ${{ inputs.limit }}
+          MAX_MINUTES: ${{ inputs.max_minutes }}
+        run: |
+          set --
+          if [ -n "$ATS" ]; then set -- "$@" --ats="$ATS"; fi
+          if [ -n "$LIMIT" ]; then set -- "$@" --limit="$LIMIT"; fi
+          budget=$(( ${MAX_MINUTES:-240} * 60000 ))
+          node engine/board-sweep.mjs --max-ms="$budget" "$@" 2>&1 | tee /tmp/sweep.log
+
+      - name: Say what the evidence would promote (a dry run; nothing is written to the registry)
+        if: always()
+        run: node engine/promote-universe.mjs --dry-run 2>&1 | tee /tmp/promote.log || true
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## Board sweep, $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo '```'
+            tail -25 /tmp/sweep.log 2>/dev/null || true
+            echo '```'
+            echo
+            echo '```'
+            head -30 /tmp/promote.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the evidence
+        if: always()
+        run: |
+          git config user.name  "youwork-board-sweep"
+          git config user.email "board-sweep@users.noreply.github.com"
+          git add -A data/universe/board-sweep.json data/universe/tokens.json
+          if git diff --staged --quiet; then
+            echo "No change in the board evidence."
+            exit 0
+          fi
+          if git diff --staged --name-only | grep -vxE 'data/universe/(board-sweep|tokens)\.json'; then
+            echo "::error title=Board sweep staged a file it does not own::refusing to commit"
+            exit 1
+          fi
+          git commit -m "board-sweep: boards read $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
+          pushed=""
+          for i in 1 2 3 4; do
+            if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
+            echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
+            if ! git pull --rebase origin "${DATA_BRANCH}"; then
+              echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
+              git rebase --abort || true
+            fi
+          done
+          if [ -z "$pushed" ]; then
+            echo "::error title=Board evidence was not committed::4 push attempts failed."
+            exit 1
+          fi
+
+      - name: Save the quiet logs in the data repository
+        if: ${{ always() && env.QUIET_LOGS == '1' }}
+        shell: bash
+        run: node engine/ci/save-logs.mjs
