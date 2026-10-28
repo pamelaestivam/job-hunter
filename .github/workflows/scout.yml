@@ -83,6 +83,14 @@ jobs:
         if: ${{ inputs.health_only == true }}
         run: node engine/scout.mjs --health-only > /tmp/health.json 2>/tmp/health.log || true
 
+      - name: Install a real browser when a rendered board is registered
+        if: ${{ inputs.health_only != true }}
+        run: |
+          if node engine/needs-browser.mjs; then
+            npm install --no-save playwright@1.49.1
+            npx playwright install --with-deps chromium
+          fi
+
       - name: Run the search
         if: ${{ inputs.health_only != true }}
         env:
