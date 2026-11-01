@@ -134,7 +134,7 @@ jobs:
           for i in 1 2 3 4; do
             if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
             echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
-            if ! git pull --rebase origin "${DATA_BRANCH}"; then
+            if ! git pull --rebase --autostash origin "${DATA_BRANCH}"; then
               echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
               git rebase --abort || true
             fi

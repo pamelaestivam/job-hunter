@@ -142,7 +142,7 @@ jobs:
         run: |
           git config user.name  "youwork-remote-scout"
           git config user.email "remote-scout@users.noreply.github.com"
-          stray=$(git diff --name-only | grep -v '^data/remote/' || true)
+          stray=$(git diff --name-only | grep -v -e '^data/remote/' -e '^data/ci-logs/' || true)
           if [ -n "$stray" ]; then
             echo "::error title=A remote-run tool modified files outside data/remote/::$(echo "$stray" | tr '\n' ' ')"
             echo "$stray"
@@ -160,14 +160,20 @@ jobs:
           n=$(node -p 'require("./data/remote/jobs.json").jobs.length')
           git commit -m "remote-scout: ${n} remote roles [skip ci]"
           pushed=""
+          conflicted=""
           for i in 1 2 3 4; do
             if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
             echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
-            if ! git pull --rebase origin "${DATA_BRANCH}"; then
+            if ! git pull --rebase --autostash origin "${DATA_BRANCH}"; then
               echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
+              conflicted=yes
               git rebase --abort || true
             fi
           done
+          if [ -z "$pushed" ] && [ -n "$conflicted" ]; then
+            echo "::error title=Remote-box results were not committed::another run changed data/remote/ while this one worked (the same workflow in the other repository?). Nothing else is wrong; dispatch it again when no other run of it is active."
+            exit 1
+          fi
           if [ -z "$pushed" ]; then
             echo "::error title=Remote-box results were not committed::4 push attempts failed."
             exit 1

@@ -162,14 +162,20 @@ jobs:
           n=$(node -p 'require("./data/extended/jobs.json").jobs.filter(j=>j.geo&&j.geo.tier==="extension").length')
           git commit -m "extended-scout: the extended box, ${n} extension-only roles [skip ci]"
           pushed=""
+          conflicted=""
           for i in 1 2 3 4; do
             if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
             echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
             if ! git pull --rebase --autostash origin "${DATA_BRANCH}"; then
               echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
+              conflicted=yes
               git rebase --abort || true
             fi
           done
+          if [ -z "$pushed" ] && [ -n "$conflicted" ]; then
+            echo "::error title=Extended-box results were not committed::another run changed data/extended/ while this one worked (the same workflow in the other repository?). Nothing else is wrong; dispatch it again when no other run of it is active."
+            exit 1
+          fi
           if [ -z "$pushed" ]; then
             echo "::error title=Extended-box results were not committed::4 push attempts failed."
             exit 1
