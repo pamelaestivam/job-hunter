@@ -10,9 +10,6 @@ on:
         description: 'Verify the best N view rows by fit (default 500, at most 2000)'
         default: '500'
         required: false
-      keys:
-        description: 'Comma-separated row keys to verify instead of the top N (counts only are printed)'
-        required: false
 
 permissions:
   contents: write
@@ -55,11 +52,8 @@ jobs:
       - name: Select and verify the rows
         env:
           TOP: ${{ inputs.top }}
-          KEYS: ${{ inputs.keys }}
         run: |
-          set --
-          if [ -n "$KEYS" ]; then set -- --keys "$KEYS"; else set -- --top "${TOP:-500}"; fi
-          node engine/market.mjs verify-select "$@" --out /tmp/keys.txt | tee /tmp/select.log
+          node engine/market.mjs verify-select --top "${TOP:-500}" --out /tmp/keys.txt | tee /tmp/select.log
           node engine/market.mjs verify --runner --keys-file /tmp/keys.txt | tee /tmp/verify.log
 
       - name: Commit the verdicts
