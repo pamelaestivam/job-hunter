@@ -33,7 +33,7 @@ defaults:
 jobs:
   remote-scout:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       YOUWORK_BOX: remote
       YOUWORK_DATA_DIR: ${{ github.workspace }}/data/remote
@@ -70,7 +70,7 @@ jobs:
         env:
           YOUWORK_BOX: ''
           YOUWORK_DATA_DIR: ''
-        run: node engine/test/run.mjs
+        run: node engine/test/run.mjs --guard=sweep
 
       - name: Seed data/remote
         run: |
