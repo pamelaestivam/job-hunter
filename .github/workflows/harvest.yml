@@ -215,8 +215,8 @@ jobs:
           gzip -k -f .market/lake.sqlite
           cp .market/lake.sqlite.gz "lake-merged-${GITHUB_RUN_ID}.sqlite.gz"
           gh release upload market-lake "lake-merged-${GITHUB_RUN_ID}.sqlite.gz" --repo "$DATA_SLUG" --clobber
-          gh api "repos/${DATA_SLUG}/releases/tags/market-lake" --jq '.assets' > /tmp/assets.json
-          node engine/market-harvest.mjs prune --assets /tmp/assets.json --keep 2 --run "${GITHUB_RUN_ID}" > /tmp/prune.json
+          gh api "repos/${DATA_SLUG}/releases/tags/market-lake" --jq '.assets' > /tmp/assets.json || echo '[]' > /tmp/assets.json
+          node engine/market-harvest.mjs prune --assets /tmp/assets.json --keep 2 --run "${GITHUB_RUN_ID}" > /tmp/prune.json || echo '[]' > /tmp/prune.json
           for id in $(node -e 'for (const a of JSON.parse(require("fs").readFileSync("/tmp/prune.json","utf8"))) console.log(a.id)'); do gh api -X DELETE "repos/${DATA_SLUG}/releases/assets/${id}" || true; done
           echo "pruned $(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/prune.json","utf8")).length)') old release assets"
           rc=0
