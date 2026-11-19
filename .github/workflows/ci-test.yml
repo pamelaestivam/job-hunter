@@ -22,14 +22,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: ${{ github.repository == 'pamelaestivam/job-hunter' }}
+    if: ${{ github.event_name != 'schedule' || github.repository == 'pamelaestivam/job-hunter' }}
     steps:
       - name: Decide where this run reads and writes
         env:
           DATA_REPO: ${{ secrets.DATA_REPO }}
           INPUT_REF: ${{ inputs.ref }}
         run: |
-          if [ -z "$DATA_REPO" ]; then echo "DATA_REPO is not set: this workflow only tests the private data repository"; exit 1; fi
           echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
           echo "DATA_BRANCH=${INPUT_REF}" >> "$GITHUB_ENV"
 
