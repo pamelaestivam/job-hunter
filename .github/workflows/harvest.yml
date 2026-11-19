@@ -40,6 +40,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      planned: ${{ steps.plan.outputs.planned }}
     steps:
       - name: Decide where this run reads and writes
         shell: bash
@@ -90,6 +91,7 @@ jobs:
           node engine/market-harvest.mjs plan "$@" > /tmp/plan.json
           echo "matrix=$(node -e 'const p=JSON.parse(require("fs").readFileSync("/tmp/plan.json","utf8"));console.log(JSON.stringify({include:p.include}))')" >> "$GITHUB_OUTPUT"
           cat /tmp/plan.json
+          echo "planned=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/plan.json","utf8")).include.length)')" >> "$GITHUB_OUTPUT"
           gzip -k -f .market/lake.sqlite
           ls -l .market/
           gh release view market-lake --repo "$DATA_SLUG" >/dev/null 2>&1 || gh release create market-lake --repo "$DATA_SLUG" --prerelease --title "Market lake (private)" --notes "Lake snapshots and shard parts. Private. Never public."
@@ -191,6 +193,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DATA_TOKEN || github.token }}
           DATA_SLUG: ${{ secrets.DATA_REPO || github.repository }}
+          PLANNED: ${{ needs.prepare.outputs.planned }}
         run: |
           mkdir -p .market parts /tmp/ctr
           gh release download market-lake --repo "$DATA_SLUG" --pattern "lake-${GITHUB_RUN_ID}.sqlite.gz" --dir .market --clobber
@@ -212,7 +215,13 @@ jobs:
           gzip -k -f .market/lake.sqlite
           cp .market/lake.sqlite.gz "lake-merged-${GITHUB_RUN_ID}.sqlite.gz"
           gh release upload market-lake "lake-merged-${GITHUB_RUN_ID}.sqlite.gz" --repo "$DATA_SLUG" --clobber
-          node engine/market-harvest.mjs counters --dir /tmp/ctr --merge /tmp/merge.json --settle /tmp/settle.json --run "h-${GITHUB_RUN_ID}"
+          gh api "repos/${DATA_SLUG}/releases/tags/market-lake" --jq '.assets' > /tmp/assets.json
+          node engine/market-harvest.mjs prune --assets /tmp/assets.json --keep 2 --run "${GITHUB_RUN_ID}" > /tmp/prune.json
+          for id in $(node -e 'for (const a of JSON.parse(require("fs").readFileSync("/tmp/prune.json","utf8"))) console.log(a.id)'); do gh api -X DELETE "repos/${DATA_SLUG}/releases/assets/${id}" || true; done
+          echo "pruned $(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/prune.json","utf8")).length)') old release assets"
+          rc=0
+          node engine/market-harvest.mjs counters --dir /tmp/ctr --merge /tmp/merge.json --settle /tmp/settle.json --planned "$PLANNED" --run "h-${GITHUB_RUN_ID}" || rc=$?
+          echo "counters_rc=$rc" > /tmp/counters_rc
 
       - name: Commit health.json and nothing else
         env:
@@ -242,6 +251,10 @@ jobs:
           done
           if [ -z "$pushed" ] && [ -n "$conflicted" ]; then echo "::error title=Harvest counters were not committed::another run changed data/market/health.json while this one worked"; exit 1; fi
           if [ -z "$pushed" ]; then echo "::error title=Harvest counters were not committed::4 push attempts failed"; exit 1; fi
+          if [ -f /tmp/counters_rc ] && ! grep -q 'counters_rc=0' /tmp/counters_rc; then
+            echo "::error title=Harvest counters disagree::shard rows written differ from merge rows in, or a planned shard never reported (data/market/health.json harvest.consistency)"
+            exit 1
+          fi
 
       - name: Save the quiet logs in the data repository
         if: ${{ always() && env.QUIET_LOGS == '1' }}
