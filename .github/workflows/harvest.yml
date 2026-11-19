@@ -65,33 +65,31 @@ jobs:
         with:
           node-version-file: '.nvmrc'
 
-      - name: Build the lake from the committed corpus
-        run: |
-          mkdir -p .market
-          node engine/market.mjs build | tee /tmp/build.log
-
-      - name: Integrity check
-        run: node engine/market-harvest.mjs check --lake .market/lake.sqlite
-
-      - name: Plan the matrix
+      - name: Build, plan and publish the lake
         id: plan
         env:
+          GH_TOKEN: ${{ secrets.DATA_TOKEN || github.token }}
+          DATA_SLUG: ${{ secrets.DATA_REPO || github.repository }}
           SYSTEMS: ${{ inputs.systems }}
           SHARDS: ${{ inputs.shards }}
           OBSERVE: ${{ inputs.observe_only }}
         run: |
+          mkdir -p .market
+          base=$(gh api "repos/${DATA_SLUG}/releases/tags/market-lake" --jq '[.assets[]|select(.name|startswith("lake-merged-"))]|sort_by(.created_at)|last|.id // empty' 2>/dev/null || true)
+          keep=""
+          if [ -n "$base" ]; then
+            gh api -H "Accept: application/octet-stream" "repos/${DATA_SLUG}/releases/assets/${base}" > .market/base.sqlite.gz
+            gunzip -f .market/base.sqlite.gz && mv .market/base.sqlite .market/lake.sqlite && keep="--keep"
+            echo "base lake: release asset ${base}"
+          fi
+          node engine/market.mjs build $keep | tee /tmp/build.log
+          node engine/market-harvest.mjs check --lake .market/lake.sqlite
           set -- --lake .market/lake.sqlite --shards "${SHARDS:-4}"
           if [ -n "$SYSTEMS" ]; then set -- "$@" --systems "$SYSTEMS"; fi
           if [ "$OBSERVE" = "true" ]; then set -- --lake .market/lake.sqlite --shards 1 --systems "${SYSTEMS:-greenhouse}"; fi
           node engine/market-harvest.mjs plan "$@" > /tmp/plan.json
           echo "matrix=$(node -e 'const p=JSON.parse(require("fs").readFileSync("/tmp/plan.json","utf8"));console.log(JSON.stringify({include:p.include}))')" >> "$GITHUB_OUTPUT"
           cat /tmp/plan.json
-
-      - name: Upload the lake as a private release asset
-        env:
-          GH_TOKEN: ${{ secrets.DATA_TOKEN || github.token }}
-          DATA_SLUG: ${{ secrets.DATA_REPO || github.repository }}
-        run: |
           gzip -k -f .market/lake.sqlite
           ls -l .market/
           gh release view market-lake --repo "$DATA_SLUG" >/dev/null 2>&1 || gh release create market-lake --repo "$DATA_SLUG" --prerelease --title "Market lake (private)" --notes "Lake snapshots and shard parts. Private. Never public."
@@ -136,50 +134,34 @@ jobs:
         with:
           node-version-file: '.nvmrc'
 
-      - name: Download the lake in this second job
+      - name: Fetch and run through the release store
         env:
           GH_TOKEN: ${{ secrets.DATA_TOKEN || github.token }}
           DATA_SLUG: ${{ secrets.DATA_REPO || github.repository }}
-        run: |
-          mkdir -p .market parts
-          gh release download market-lake --repo "$DATA_SLUG" --pattern "lake-${GITHUB_RUN_ID}.sqlite.gz" --dir .market --clobber
-          gunzip -f ".market/lake-${GITHUB_RUN_ID}.sqlite.gz"
-          mv ".market/lake-${GITHUB_RUN_ID}.sqlite" .market/lake.sqlite
-          node engine/market-harvest.mjs check --lake .market/lake.sqlite
-
-      - name: Read this shard
-        env:
           ATS: ${{ matrix.ats }}
           SLICE: ${{ matrix.slice }}
           NAME: ${{ matrix.name }}
           MAXMIN: ${{ inputs.max_minutes }}
           OBSERVE: ${{ inputs.observe_only }}
         run: |
+          mkdir -p .market parts
+          gh release download market-lake --repo "$DATA_SLUG" --pattern "lake-${GITHUB_RUN_ID}.sqlite.gz" --dir .market --clobber
+          gunzip -f ".market/lake-${GITHUB_RUN_ID}.sqlite.gz"
+          mv ".market/lake-${GITHUB_RUN_ID}.sqlite" .market/lake.sqlite
+          node engine/market-harvest.mjs check --lake .market/lake.sqlite
           set -- --ats "$ATS" --slice "$SLICE" --part "parts/part-${NAME}.sqlite" --run "h-${GITHUB_RUN_ID}" --max-minutes "${MAXMIN:-40}"
           if [ "$OBSERVE" = "true" ]; then set -- "$@" --limit 2; fi
           node engine/market-harvest.mjs shard "$@" | tee "/tmp/shard-${NAME}.log"
-
-      - name: Upload the part
-        env:
-          GH_TOKEN: ${{ secrets.DATA_TOKEN || github.token }}
-          DATA_SLUG: ${{ secrets.DATA_REPO || github.repository }}
-          NAME: ${{ matrix.name }}
-        run: |
           gzip -k -f "parts/part-${NAME}.sqlite"
           cp "parts/part-${NAME}.sqlite.gz" "part-${GITHUB_RUN_ID}-${NAME}.sqlite.gz"
           cp "parts/part-${NAME}.sqlite.counters.json" "counters-${GITHUB_RUN_ID}-${NAME}.json"
           gh release upload market-lake "part-${GITHUB_RUN_ID}-${NAME}.sqlite.gz" "counters-${GITHUB_RUN_ID}-${NAME}.json" --repo "$DATA_SLUG" --clobber
 
-      - name: Save the quiet logs in the data repository
-        if: ${{ always() && env.QUIET_LOGS == '1' }}
-        shell: bash
-        run: node engine/ci/save-logs.mjs
-
   merge:
     needs: [prepare, shard]
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Decide where this run reads and writes
         shell: bash
@@ -205,45 +187,32 @@ jobs:
         with:
           node-version-file: '.nvmrc'
 
-      - name: Download the lake and every part of this run
+      - name: Fetch and run through the release store
         env:
           GH_TOKEN: ${{ secrets.DATA_TOKEN || github.token }}
           DATA_SLUG: ${{ secrets.DATA_REPO || github.repository }}
         run: |
-          mkdir -p .market parts
+          mkdir -p .market parts /tmp/ctr
           gh release download market-lake --repo "$DATA_SLUG" --pattern "lake-${GITHUB_RUN_ID}.sqlite.gz" --dir .market --clobber
           gunzip -f ".market/lake-${GITHUB_RUN_ID}.sqlite.gz"
           mv ".market/lake-${GITHUB_RUN_ID}.sqlite" .market/lake.sqlite
-          gh release download market-lake --repo "$DATA_SLUG" --pattern "part-${GITHUB_RUN_ID}-*.sqlite.gz" --dir parts --clobber || echo "no parts (an observe-only run, or every shard failed)"
-          gh release download market-lake --repo "$DATA_SLUG" --pattern "counters-${GITHUB_RUN_ID}-*.json" --dir parts --clobber || true
-          for f in parts/*.sqlite.gz; do [ -e "$f" ] && gunzip -f "$f"; done || true
-          for f in parts/counters-*.json; do [ -e "$f" ] && mv "$f" "${f%.json}.counters.json"; done || true
-          ls -l parts .market
-
-      - name: Merge the parts into the lake
-        run: |
+          gh release download market-lake --repo "$DATA_SLUG" --pattern "part-${GITHUB_RUN_ID}-*.sqlite.gz" --dir parts --clobber || echo "no parts (every shard failed)"
+          gh release download market-lake --repo "$DATA_SLUG" --pattern "counters-${GITHUB_RUN_ID}-*.json" --dir /tmp/ctr --clobber || true
+          for f in parts/*.sqlite.gz; do if [ -e "$f" ]; then gunzip -f "$f"; fi; done
+          for f in /tmp/ctr/counters-*.json; do if [ -e "$f" ]; then mv "$f" "${f%.json}.counters.json"; fi; done
           parts=$(ls parts/part-*.sqlite 2>/dev/null | paste -sd, - || true)
           if [ -n "$parts" ]; then
             node engine/market-harvest.mjs merge --lake .market/lake.sqlite --parts "$parts" --run "h-${GITHUB_RUN_ID}" | tee /tmp/merge.json
           else
             echo '{}' > /tmp/merge.json
           fi
-
-      - name: Integrity check, then upload the merged lake
-        env:
-          GH_TOKEN: ${{ secrets.DATA_TOKEN || github.token }}
-          DATA_SLUG: ${{ secrets.DATA_REPO || github.repository }}
-        run: |
+          node engine/market-harvest.mjs settle --lake .market/lake.sqlite | tee /tmp/settle.json
+          node engine/market.mjs build --keep | tee /tmp/enrich.log > /dev/null
           node engine/market-harvest.mjs check --lake .market/lake.sqlite
           gzip -k -f .market/lake.sqlite
           cp .market/lake.sqlite.gz "lake-merged-${GITHUB_RUN_ID}.sqlite.gz"
           gh release upload market-lake "lake-merged-${GITHUB_RUN_ID}.sqlite.gz" --repo "$DATA_SLUG" --clobber
-
-      - name: Write the counters into data/market/health.json
-        run: |
-          mkdir -p /tmp/ctr
-          cp parts/*.counters.json /tmp/ctr/ 2>/dev/null || true
-          node engine/market-harvest.mjs counters --dir /tmp/ctr --merge /tmp/merge.json --run "h-${GITHUB_RUN_ID}"
+          node engine/market-harvest.mjs counters --dir /tmp/ctr --merge /tmp/merge.json --settle /tmp/settle.json --run "h-${GITHUB_RUN_ID}"
 
       - name: Commit health.json and nothing else
         env:
@@ -261,11 +230,17 @@ jobs:
           if git diff --staged --quiet; then echo "nothing to commit"; exit 0; fi
           git commit -m "market-harvest: counters for run ${GITHUB_RUN_ID} [skip ci]"
           pushed=""
+          conflicted=""
           for i in 1 2 3 4; do
             if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
             echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
-            git pull --rebase --autostash origin "${DATA_BRANCH}" || git rebase --abort || true
+            if ! git pull --rebase --autostash origin "${DATA_BRANCH}"; then
+              echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
+              conflicted=yes
+              git rebase --abort || true
+            fi
           done
+          if [ -z "$pushed" ] && [ -n "$conflicted" ]; then echo "::error title=Harvest counters were not committed::another run changed data/market/health.json while this one worked"; exit 1; fi
           if [ -z "$pushed" ]; then echo "::error title=Harvest counters were not committed::4 push attempts failed"; exit 1; fi
 
       - name: Save the quiet logs in the data repository
