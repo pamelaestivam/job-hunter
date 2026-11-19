@@ -18,6 +18,18 @@ on:
         description: 'Minutes each shard may read before it stops and reports what it did not reach'
         default: '40'
         required: false
+      workday_surface:
+        description: 'Workday only: cxs (the JSON list, throttled per address), sitemap (siteMap.xml plus each page JobPosting) or auto (sitemap, and the CXS list too when the sitemap is a window)'
+        default: 'auto'
+        required: false
+      workday_pass:
+        description: 'Workday only: all (boards with in-box inventory first, then the rest) or inbox (only boards the sweep measured with in-box postings)'
+        default: 'inbox'
+        required: false
+      bodies:
+        description: 'Descriptions pass: read only the boards that hold an eligible posting with no description yet, and keep the description of exactly those postings'
+        type: boolean
+        default: false
       observe_only:
         description: 'Only prove the storage ladder (upload a lake, download it in a second job), read no board'
         type: boolean
@@ -145,6 +157,9 @@ jobs:
           NAME: ${{ matrix.name }}
           MAXMIN: ${{ inputs.max_minutes }}
           OBSERVE: ${{ inputs.observe_only }}
+          WDSURFACE: ${{ inputs.workday_surface }}
+          WDPASS: ${{ inputs.workday_pass }}
+          BODIES: ${{ inputs.bodies }}
         run: |
           mkdir -p .market parts
           gh release download market-lake --repo "$DATA_SLUG" --pattern "lake-${GITHUB_RUN_ID}.sqlite.gz" --dir .market --clobber
@@ -153,6 +168,8 @@ jobs:
           node engine/market-harvest.mjs check --lake .market/lake.sqlite
           set -- --ats "$ATS" --slice "$SLICE" --part "parts/part-${NAME}.sqlite" --run "h-${GITHUB_RUN_ID}" --max-minutes "${MAXMIN:-40}"
           if [ "$OBSERVE" = "true" ]; then set -- "$@" --limit 2; fi
+          if [ "$ATS" = "workday" ]; then set -- "$@" --surface "${WDSURFACE:-auto}" --pass "${WDPASS:-inbox}"; fi
+          if [ "$BODIES" = "true" ]; then set -- "$@" --bodies auto; fi
           node engine/market-harvest.mjs shard "$@" | tee "/tmp/shard-${NAME}.log"
           gzip -k -f "parts/part-${NAME}.sqlite"
           cp "parts/part-${NAME}.sqlite.gz" "part-${GITHUB_RUN_ID}-${NAME}.sqlite.gz"

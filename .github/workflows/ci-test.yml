@@ -1,0 +1,49 @@
+name: ci-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository whose head commit is tested'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-test-${{ inputs.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ github.repository == 'pamelaestivam/job-hunter' }}
+    steps:
+      - name: Decide where this run reads and writes
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -z "$DATA_REPO" ]; then echo "DATA_REPO is not set: this workflow only tests the private data repository"; exit 1; fi
+          echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+          echo "DATA_BRANCH=${INPUT_REF}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO }}
+          token: ${{ secrets.DATA_TOKEN }}
+          ref: ${{ env.DATA_BRANCH }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: '.nvmrc' }
+
+      - name: Run the checks and write the test status
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          STATUS_TOKEN: ${{ secrets.DATA_TOKEN }}
+        run: |
+          node engine/ci/ci-test.mjs --sha "$(git rev-parse HEAD)" --repo "$DATA_REPO"

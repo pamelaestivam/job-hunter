@@ -1,0 +1,92 @@
+name: verify-market
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch of the data repository to run against (blank = its default branch)'
+        required: false
+      top:
+        description: 'Verify the best N view rows by fit (default 500, at most 2000)'
+        default: '500'
+        required: false
+      keys:
+        description: 'Comma-separated row keys to verify instead of the top N (counts only are printed)'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youwork-liveness-write
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: node engine/ci/quiet-shell.mjs {0}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Decide where this run reads and writes
+        shell: bash
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$DATA_REPO" ]; then
+            echo "QUIET_LOGS=1" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-master}" >> "$GITHUB_ENV"
+          else
+            echo "QUIET_LOGS=" >> "$GITHUB_ENV"
+            echo "DATA_BRANCH=${INPUT_REF:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.DATA_REPO || github.repository }}
+          token: ${{ secrets.DATA_TOKEN || github.token }}
+          ref: ${{ env.DATA_BRANCH }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: '.nvmrc' }
+
+      - name: Select and verify the rows
+        env:
+          TOP: ${{ inputs.top }}
+          KEYS: ${{ inputs.keys }}
+        run: |
+          set --
+          if [ -n "$KEYS" ]; then set -- --keys "$KEYS"; else set -- --top "${TOP:-500}"; fi
+          node engine/market.mjs verify-select "$@" --out /tmp/keys.txt | tee /tmp/select.log
+          node engine/market.mjs verify --runner --keys-file /tmp/keys.txt | tee /tmp/verify.log
+
+      - name: Commit the verdicts
+        run: |
+          git config user.name  "youwork-market-verify"
+          git config user.email "market-verify@users.noreply.github.com"
+          git add -A data/liveness.json
+          if git diff --staged --quiet; then
+            echo "No change in liveness evidence."
+            exit 0
+          fi
+          git commit -m "market: rows verified $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
+          pushed=""
+          for i in 1 2 3 4; do
+            if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
+            echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
+            if ! git pull --rebase --autostash origin "${DATA_BRANCH}"; then
+              echo "::warning title=Rebase conflicted::aborting and retrying from our own commit"
+              git rebase --abort || true
+            fi
+          done
+          if [ -z "$pushed" ]; then
+            echo "::error title=Verdicts were not committed::4 push attempts failed. The verdicts exist only in this run's log."
+            exit 1
+          fi
+
+      - name: Save the quiet logs in the data repository
+        if: ${{ always() && env.QUIET_LOGS == '1' }}
+        shell: bash
+        run: node engine/ci/save-logs.mjs
