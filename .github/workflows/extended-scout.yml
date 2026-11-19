@@ -70,7 +70,7 @@ jobs:
         env:
           YOUWORK_BOX: ''
           YOUWORK_DATA_DIR: ''
-        run: node engine/test/run.mjs
+        run: node engine/test/run.mjs --guard=sweep
 
       - name: Seed data/extended
         run: |

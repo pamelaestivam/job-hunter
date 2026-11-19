@@ -74,7 +74,7 @@ jobs:
           node-version-file: '.nvmrc'
 
       - name: Self-test the engine before trusting a run
-        run: node engine/test/run.mjs
+        run: node engine/test/run.mjs --guard=sweep
 
       - name: Attest every generated artifact
         run: node engine/attest.mjs --all
@@ -173,6 +173,14 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Record employers that keep failing in the work ledger
+        if: ${{ inputs.health_only != true }}
+        run: node engine/stuck-employers.mjs || true
+
+      - name: Report data health in the work ledger
+        if: ${{ inputs.health_only != true }}
+        run: node engine/data-health.mjs --ledger --report-only || true
+
       - name: Check data/ holds together before committing it
         if: ${{ inputs.health_only != true }}
         run: node engine/verify-data.mjs
@@ -187,6 +195,7 @@ jobs:
           git config user.name  "youwork-scout"
           git config user.email "scout@users.noreply.github.com"
           git add -A data/ ':(exclude)data/ci-logs'
+          git add clients/pamela/39-work-ledger.md
           if git diff --staged --quiet; then
             echo "No change in the market since the last run."
             exit 0
@@ -203,7 +212,11 @@ jobs:
             if git push origin "HEAD:${DATA_BRANCH}"; then pushed=yes; break; fi
             echo "push failed, retrying in $((2**i))s"; sleep $((2**i))
             if ! git pull --rebase --autostash origin "${DATA_BRANCH}"; then
-              if node engine/merge-data.mjs && git add -A data/ && GIT_EDITOR=true git rebase --continue; then
+              REDO=""
+              if git diff --name-only --diff-filter=U | grep -qE 'coverage-debt.json|39-work-ledger.md'; then
+                git checkout --ours -- data/coverage-debt.json clients/pamela/39-work-ledger.md && REDO=1
+              fi
+              if node engine/merge-data.mjs && { [ -z "$REDO" ] || node engine/stuck-employers.mjs || true; } && git add -A data/ clients/pamela/39-work-ledger.md && GIT_EDITOR=true git rebase --continue; then
                 echo "resolved a data/ conflict with merge-data.mjs"
               else
                 echo "::warning title=Could not resolve the data/ conflict::rebase aborted; retrying from our own commit"

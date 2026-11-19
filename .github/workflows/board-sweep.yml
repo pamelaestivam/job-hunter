@@ -71,6 +71,7 @@ jobs:
           if [ -n "$ATS" ]; then set -- "$@" --ats="$ATS"; fi
           if [ -n "$LIMIT" ]; then set -- "$@" --limit="$LIMIT"; fi
           budget=$(( ${MAX_MINUTES:-240} * 60000 ))
+          export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=3072"
           node engine/board-sweep.mjs --max-ms="$budget" "$@" 2>&1 | tee /tmp/sweep.log
 
       - name: Say what the evidence would promote (a dry run; nothing is written to the registry)
