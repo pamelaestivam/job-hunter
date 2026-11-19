@@ -136,7 +136,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
 
-      - name: Download the lake (second job: proves the ladder)
+      - name: Download the lake in this second job
         env:
           GH_TOKEN: ${{ secrets.DATA_TOKEN || github.token }}
           DATA_SLUG: ${{ secrets.DATA_REPO || github.repository }}
